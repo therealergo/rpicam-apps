@@ -57,7 +57,12 @@ private:
 	bool abort_video_;
 	bool abort_audio_;
 	uint64_t video_start_ts_;
+	uint64_t audio_start_ts_;
 	uint64_t audio_samples_;
+	unsigned int count_file_;
+	unsigned int count_frame_;
+	unsigned int count_frame_segment_lim_;
+	const char *format_;
 
 	std::queue<AVFrame *> frame_queue_;
 	std::mutex video_mutex_;

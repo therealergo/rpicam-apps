@@ -189,23 +189,23 @@ void LibAvEncoder::initVideoCodec(VideoOptions const *options, StreamInfo const 
 	const std::string udp { "udp://" };
 
 	// Setup an appropriate stream/container format.
-	const char *format = nullptr;
+	format_ = nullptr;
 	if (options->libav_format.empty())
 	{
 		// Check if output_file_ starts with a "tcp://" or "udp://" url.
-		// C++ 20 has a convenient starts_with() function for this which we may eventually use.		
+		// C++ 20 has a convenient starts_with() function for this which we may eventually use.
 		if (output_file_.empty() ||
 			output_file_.find(tcp.c_str(), 0, tcp.length()) != std::string::npos ||
 			output_file_.find(udp.c_str(), 0, udp.length()) != std::string::npos)
 		{
 			if (options->libav_video_codec == "h264_v4l2m2m" || options->libav_video_codec == "libx264")
-				format = "h264";
+				format_ = "h264";
 			else
 				throw std::runtime_error("libav: please specify output format with the --libav-format argument");
 		}
 	}
 	else
-		format = options->libav_format.c_str();
+		format_ = options->libav_format.c_str();
 
 	// Legacy handling of the --listen parameter.  If missing from the url string, add "?listen=1" to the end.
 	if (options->listen && output_file_.find(tcp.c_str(), 0, tcp.length()) != std::string::npos)
@@ -217,35 +217,9 @@ void LibAvEncoder::initVideoCodec(VideoOptions const *options, StreamInfo const 
 			output_file_ += listen;
 	}
 
-	assert(out_fmt_ctx_ == nullptr);
-	avformat_alloc_output_context2(&out_fmt_ctx_, nullptr, format, output_file_.c_str());
-	if (!out_fmt_ctx_)
-		throw std::runtime_error("libav: cannot allocate output context, try setting with --libav-format");
-
-	if (out_fmt_ctx_->oformat->flags & AVFMT_GLOBALHEADER)
-		codec_ctx_[Video]->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-
 	int ret = avcodec_open2(codec_ctx_[Video], codec, nullptr);
 	if (ret < 0)
 		throw std::runtime_error("libav: unable to open video codec: " + std::to_string(ret));
-
-	// Video stream
-	stream_[Video] = avformat_new_stream(out_fmt_ctx_, codec);
-	if (!stream_[Video])
-		throw std::runtime_error("libav: cannot allocate stream for vidout output context");
-
-	// The avi stream context seems to need the video stream time_base set to
-	// 1/framerate to report the correct framerate in the container file.
-	//
-	// This seems to be a limitation/bug in ffmpeg:
-	// https://github.com/FFmpeg/FFmpeg/blob/3141dbb7adf1e2bd5b9ff700312d7732c958b8df/libavformat/avienc.c#L527
-	if (!strncmp(out_fmt_ctx_->oformat->name, "avi", 3))
-		stream_[Video]->time_base = { 1000, (int)(options->framerate.value_or(DEFAULT_FRAMERATE) * 1000) };
-	else
-		stream_[Video]->time_base = codec_ctx_[Video]->time_base;
-
-	stream_[Video]->avg_frame_rate = stream_[Video]->r_frame_rate = codec_ctx_[Video]->framerate;
-	avcodec_parameters_from_context(stream_[Video]->codecpar, codec_ctx_[Video]);
 }
 
 void LibAvEncoder::initAudioInCodec(VideoOptions const *options, StreamInfo const &info)
@@ -324,29 +298,29 @@ void LibAvEncoder::initAudioOutCodec(VideoOptions const *options, StreamInfo con
 	// usec timebase
 	codec_ctx_[AudioOut]->time_base = { 1, 1000 * 1000 };
 
-	assert(out_fmt_ctx_);
-	if (out_fmt_ctx_->oformat->flags & AVFMT_GLOBALHEADER)
-		codec_ctx_[AudioOut]->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-
 	int ret = avcodec_open2(codec_ctx_[AudioOut], codec, nullptr);
 	if (ret < 0)
 		throw std::runtime_error("libav: unable to open audio codec: " + std::to_string(ret));
-
-	stream_[AudioOut] = avformat_new_stream(out_fmt_ctx_, codec);
-	if (!stream_[AudioOut])
-		throw std::runtime_error("libav: cannot allocate stream for audio output context");
-
-	stream_[AudioOut]->time_base = codec_ctx_[AudioOut]->time_base;
-	avcodec_parameters_from_context(stream_[AudioOut]->codecpar, codec_ctx_[AudioOut]);
 }
 
 LibAvEncoder::LibAvEncoder(VideoOptions const *options, StreamInfo const &info)
-	: Encoder(options), output_ready_(false), abort_video_(false), abort_audio_(false), video_start_ts_(0),
-	  audio_samples_(0), in_fmt_ctx_(nullptr), out_fmt_ctx_(nullptr), output_file_(options->output)
+	: Encoder(options), output_ready_(false), abort_video_(false), abort_audio_(false), video_start_ts_(0), audio_start_ts_(0),
+	  audio_samples_(0), count_file_(0), count_frame_(0), in_fmt_ctx_(nullptr), out_fmt_ctx_(nullptr), output_file_(options->output)
 {
-	if (options->circular || options->segment || !options->save_pts.empty() || options->split)
-		LOG_ERROR("\nERROR: Pi 5 and libav encoder does not currently support the circular, segment, save_pts or "
+	if (options->circular || !options->save_pts.empty() || options->split)
+		LOG_ERROR("\nERROR: Pi 5 and libav encoder does not currently support the circular, save_pts or "
 				  "split command line options, they will be ignored!\n");
+
+	if (options_->segment)
+	{
+		count_frame_segment_lim_ = options->framerate.value_or(DEFAULT_FRAMERATE) * options_->segment / 1000;
+		if (count_frame_segment_lim_ == 0)
+			count_frame_segment_lim_ = 1;
+	}
+	else
+	{
+		count_frame_segment_lim_ = 0;
+	}
 
 	avdevice_register_all();
 
@@ -360,8 +334,6 @@ LibAvEncoder::LibAvEncoder(VideoOptions const *options, StreamInfo const &info)
 		initAudioOutCodec(options, info);
 		av_dump_format(in_fmt_ctx_, 0, options_->audio_device.c_str(), 0);
 	}
-
-	av_dump_format(out_fmt_ctx_, 0, output_file_.c_str(), 1);
 
 	LOG(2, "libav: codec init completed");
 
@@ -382,7 +354,6 @@ LibAvEncoder::~LibAvEncoder()
 	abort_video_ = true;
 	video_thread_.join();
 
-	avformat_free_context(out_fmt_ctx_);
 	avcodec_free_context(&codec_ctx_[Video]);
 
 	if (options_->libav_audio)
@@ -401,16 +372,12 @@ void LibAvEncoder::EncodeBuffer(int fd, size_t size, void *mem, StreamInfo const
 	if (!frame)
 		throw std::runtime_error("libav: could not allocate AVFrame");
 
-	if (!video_start_ts_)
-		video_start_ts_ = timestamp_us;
-
 	frame->format = codec_ctx_[Video]->pix_fmt;
 	frame->width = info.width;
 	frame->height = info.height;
 	frame->linesize[0] = info.stride;
 	frame->linesize[1] = frame->linesize[2] = info.stride >> 1;
-	frame->pts = timestamp_us - video_start_ts_ +
-				 (options_->av_sync.value < 0us ? -options_->av_sync.get<std::chrono::microseconds>() : 0);
+	frame->pts = timestamp_us + (options_->av_sync.value < 0us ? -options_->av_sync.get<std::chrono::microseconds>() : 0);
 
 	if (codec_ctx_[Video]->pix_fmt == AV_PIX_FMT_DRM_PRIME)
 	{
@@ -453,34 +420,99 @@ void LibAvEncoder::EncodeBuffer(int fd, size_t size, void *mem, StreamInfo const
 
 void LibAvEncoder::initOutput()
 {
-	int ret;
+	// Select output filename
+	std::string filename;
+	if (output_file_.empty())
+	{
+		filename = std::string("/dev/null");
+	}
+	else if (output_file_ == "-")
+	{
+		filename = std::string("pipe:"); // libav uses "pipe:" for stdout
+	}
+	else if (options_->segment)
+	{
+		char filename_buf[256];
+		int n = snprintf(filename_buf, sizeof(filename_buf), output_file_.c_str(), count_file_);
+		count_file_++;
+		if (options_->wrap)
+			count_file_ = count_file_ % options_->wrap;
+		if (n < 0)
+			throw std::runtime_error("failed to generate filename");
+		filename = std::string(filename_buf);
+	} else {
+		filename = output_file_;
+	}
 
-	// Copy the global header from the video encode context once the first frame
+	// Allocate output context
+	assert(out_fmt_ctx_ == nullptr);
+	avformat_alloc_output_context2(&out_fmt_ctx_, nullptr, format_, filename.c_str());
+	if (!out_fmt_ctx_)
+		throw std::runtime_error("libav: cannot allocate output context, try setting with --libav-format");
+
+	// Copy global header flag from context to video codec
+	if (out_fmt_ctx_->oformat->flags & AVFMT_GLOBALHEADER)
+		codec_ctx_[Video]->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+
+	// Allocate video output stream
+	stream_[Video] = avformat_new_stream(out_fmt_ctx_, codec_ctx_[Video]->codec);
+	if (!stream_[Video])
+		throw std::runtime_error("libav: cannot allocate stream for vidout output context");
+
+	// The avi stream context seems to need the video stream time_base set to
+	// 1/framerate to report the correct framerate in the container file.
+	//
+	// This seems to be a limitation/bug in ffmpeg:
+	// https://github.com/FFmpeg/FFmpeg/blob/3141dbb7adf1e2bd5b9ff700312d7732c958b8df/libavformat/avienc.c#L527
+	if (!strncmp(out_fmt_ctx_->oformat->name, "avi", 3))
+		stream_[Video]->time_base = { 1000, (int)(options_->framerate.value_or(DEFAULT_FRAMERATE) * 1000) };
+	else
+		stream_[Video]->time_base = codec_ctx_[Video]->time_base;
+
+	stream_[Video]->avg_frame_rate = stream_[Video]->r_frame_rate = codec_ctx_[Video]->framerate;
+	avcodec_parameters_from_context(stream_[Video]->codecpar, codec_ctx_[Video]);
+
+	if (options_->libav_audio)
+	{
+		// Copy global header flag from context to audio codec
+		if (out_fmt_ctx_->oformat->flags & AVFMT_GLOBALHEADER)
+			codec_ctx_[AudioOut]->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+
+		// Allocate audio output stream
+		stream_[AudioOut] = avformat_new_stream(out_fmt_ctx_, codec_ctx_[AudioOut]->codec);
+		if (!stream_[AudioOut])
+			throw std::runtime_error("libav: cannot allocate stream for audio output context");
+
+		stream_[AudioOut]->time_base = codec_ctx_[AudioOut]->time_base;
+		avcodec_parameters_from_context(stream_[AudioOut]->codecpar, codec_ctx_[AudioOut]);
+	}
+
+	// Print resulting context
+	av_dump_format(out_fmt_ctx_, 0, filename.c_str(), 1);
+
+	// Copy the global header from the video encode context now that the first frame
 	// has been encoded.
 	avcodec_parameters_from_context(stream_[Video]->codecpar, codec_ctx_[Video]);
 
-	char err[64];
+	// Open output file
 	if (!(out_fmt_ctx_->flags & AVFMT_NOFILE))
 	{
-		std::string filename = output_file_.empty() ? "/dev/null" : output_file_;
-
-		// libav uses "pipe:" for stdout
-		if (filename == "-")
-			filename = std::string("pipe:");
-
-		ret = avio_open2(&out_fmt_ctx_->pb, filename.c_str(), AVIO_FLAG_WRITE, nullptr, nullptr);
-		if (ret < 0)
+		int ret_open = avio_open2(&out_fmt_ctx_->pb, filename.c_str(), AVIO_FLAG_WRITE, nullptr, nullptr);
+		if (ret_open < 0)
 		{
-			av_strerror(ret, err, sizeof(err));
-			throw std::runtime_error("libav: unable to open output mux for " + output_file_ + ": " + err);
+			char err_open[64];
+			av_strerror(ret_open, err_open, sizeof(err_open));
+			throw std::runtime_error("libav: unable to open output mux for " + output_file_ + ": " + err_open);
 		}
 	}
 
-	ret = avformat_write_header(out_fmt_ctx_, nullptr);
-	if (ret < 0)
+	// Write output file header
+	int ret_write = avformat_write_header(out_fmt_ctx_, nullptr);
+	if (ret_write < 0)
 	{
-		av_strerror(ret, err, sizeof(err));
-		throw std::runtime_error("libav: unable write output mux header for " + output_file_ + ": " + err);
+		char err_write[64];
+		av_strerror(ret_write, err_write, sizeof(err_write));
+		throw std::runtime_error("libav: unable write output mux header for " + output_file_ + ": " + err_write);
 	}
 }
 
@@ -493,6 +525,9 @@ void LibAvEncoder::deinitOutput()
 
 	if (!(out_fmt_ctx_->flags & AVFMT_NOFILE))
 		avio_closep(&out_fmt_ctx_->pb);
+
+	avformat_free_context(out_fmt_ctx_);
+	out_fmt_ctx_ = nullptr;
 }
 
 void LibAvEncoder::encode(AVPacket *pkt, unsigned int stream_id)
@@ -527,6 +562,47 @@ void LibAvEncoder::encode(AVPacket *pkt, unsigned int stream_id)
 		av_packet_rescale_ts(pkt, codec_ctx_[stream_id]->time_base, out_fmt_ctx_->streams[stream_id]->time_base);
 
 		std::scoped_lock<std::mutex> lock(output_mutex_);
+
+		// When we've reached the split frame count, and we're on a key frame
+		if (count_frame_segment_lim_ > 0)
+		{
+			if (stream_id == Video)
+			{
+				count_frame_++;
+			}
+			if (count_frame_ >= count_frame_segment_lim_ &&
+			    (pkt->flags & AV_PKT_FLAG_KEY) != 0)
+			{
+				count_frame_ = 0;
+
+				// Close current file
+				deinitOutput();
+
+				// Reset all timestamps, re-syncing audio and video
+				video_start_ts_ = 0;
+				audio_start_ts_ = 0;
+
+				// Open new file
+				initOutput();
+			}
+		}
+
+		// Adjust output timestamps based on current computed start timestamps
+		if (stream_id == Video)
+		{
+			if (video_start_ts_ == 0)
+				video_start_ts_ = pkt->dts;
+			pkt->pts -= video_start_ts_;
+			pkt->dts -= video_start_ts_;
+		}
+		else
+		{
+			if (audio_start_ts_ == 0)
+				audio_start_ts_ = pkt->dts;
+			pkt->pts -= audio_start_ts_;
+			pkt->dts -= audio_start_ts_;
+		}
+
 		// pkt is now blank (av_interleaved_write_frame() takes ownership of
 		// its contents and resets pkt), so that no unreferencing is necessary.
 		// This would be different if one used av_write_frame().
@@ -615,7 +691,7 @@ void LibAvEncoder::audioThread()
 
 #if LIBAVUTIL_VERSION_MAJOR < 57
 	conv = swr_alloc_set_opts(nullptr, av_get_default_channel_layout(codec_ctx_[AudioOut]->channels), required_fmt,
-							  stream_[AudioOut]->codecpar->sample_rate,
+							  codec_ctx_[AudioOut]->sample_rate,
 							  av_get_default_channel_layout(codec_ctx_[AudioIn]->channels),
 							  codec_ctx_[AudioIn]->sample_fmt, codec_ctx_[AudioIn]->sample_rate, 0, nullptr);
 
@@ -623,7 +699,7 @@ void LibAvEncoder::audioThread()
 	fifo = av_audio_fifo_alloc(required_fmt, codec_ctx_[AudioOut]->channels, codec_ctx_[AudioOut]->sample_rate * 2);
 #else
 	ret = swr_alloc_set_opts2(&conv, &codec_ctx_[AudioOut]->ch_layout, required_fmt,
-							  stream_[AudioOut]->codecpar->sample_rate, &codec_ctx_[AudioIn]->ch_layout,
+							  codec_ctx_[AudioOut]->sample_rate, &codec_ctx_[AudioIn]->ch_layout,
 							  codec_ctx_[AudioIn]->sample_fmt, codec_ctx_[AudioIn]->sample_rate, 0, nullptr);
 	if (ret < 0)
 		throw std::runtime_error("libav: cannot create swr context");
@@ -688,7 +764,7 @@ void LibAvEncoder::audioThread()
 		{
 			using namespace std::chrono_literals;
 			// Pre-record number of samples needed.
-			const unsigned int ns = pre_record_time * stream_[AudioOut]->codecpar->sample_rate / 1s;
+			const unsigned int ns = pre_record_time * codec_ctx_[AudioOut]->sample_rate / 1s;
 			unsigned int r = ns % codec_ctx_[AudioOut]->frame_size;
 			// Number of pre-record samples rounded to the frame size.
 			unsigned int ps = !r ? ns : ns + codec_ctx_[AudioOut]->frame_size - r;
