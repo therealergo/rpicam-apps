@@ -432,8 +432,22 @@ void LibAvEncoder::initOutput()
 	}
 	else if (options_->segment)
 	{
-		char filename_buf[256];
-		int n = snprintf(filename_buf, sizeof(filename_buf), output_file_.c_str(), count_file_);
+		char filename_buf[256] = {};
+		int n = -1;
+		if (output_file_.find("%s") != std::string::npos)
+		{
+			time_t time_now = time(nullptr);
+			struct tm* time_local = localtime(&time_now);
+			char time_buf[256] = {};
+			int n2 = strftime(time_buf, sizeof(time_buf) - 1, "%d-%b-%y_%I-%M-%S%p_%Z", time_local);
+			if (n2 <= 0)
+				throw std::runtime_error("failed to generate timestamp");
+			n = snprintf(filename_buf, sizeof(filename_buf) - 1, output_file_.c_str(), time_buf, count_file_);
+		}
+		else
+		{
+			n = snprintf(filename_buf, sizeof(filename_buf) - 1, output_file_.c_str(), count_file_);
+		}
 		count_file_++;
 		if (options_->wrap)
 			count_file_ = count_file_ % options_->wrap;
