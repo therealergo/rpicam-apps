@@ -313,6 +313,8 @@ Options::Options()
 			"Set an input GPIO line that controls recording.")
 		("line-out", value<unsigned int>(&line_out)->default_value(0),
 			"Set an output GPIO line that blinks at 1Hz while recording.")
+		("preview-out", value<std::string>(&preview_out),
+			"Set the periodic preview image file name")
 		;
 	// clang-format on
 

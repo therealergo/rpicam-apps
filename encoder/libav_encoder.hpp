@@ -49,6 +49,7 @@ private:
 	void initOutput();
 	void deinitOutput();
 	void encode(AVPacket *pkt, unsigned int stream_id);
+	void encodeJPEG(AVFrame *frame);
 
 	void videoThread();
 	void audioThread();
@@ -70,6 +71,7 @@ private:
 	struct gpiod_line *line_in_;
 	struct gpiod_line *line_out_;
 	unsigned int count_frame_line_out_;
+	unsigned int count_frame_preview_out_;
 
 	std::queue<AVFrame *> frame_queue_;
 	std::mutex video_mutex_;

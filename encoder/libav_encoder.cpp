@@ -19,6 +19,13 @@
 
 #include "libav_encoder.hpp"
 
+#include <jpeglib.h>
+#if JPEG_LIB_VERSION_MAJOR > 9 || (JPEG_LIB_VERSION_MAJOR == 9 && JPEG_LIB_VERSION_MINOR >= 4)
+typedef size_t jpeg_mem_len_t;
+#else
+typedef unsigned long jpeg_mem_len_t;
+#endif
+
 namespace {
 
 void encoderOptionsGeneral(VideoOptions const *options, AVCodecContext *codec)
@@ -305,7 +312,7 @@ void LibAvEncoder::initAudioOutCodec(VideoOptions const *options, StreamInfo con
 
 LibAvEncoder::LibAvEncoder(VideoOptions const *options, StreamInfo const &info)
 	: Encoder(options), output_ready_(false), abort_video_(false), abort_audio_(false), video_start_ts_(0), audio_start_ts_(0),  audio_samples_(0), count_file_(0), count_frame_(0),
-	  chip_(nullptr), line_in_(nullptr), line_out_(nullptr), count_frame_line_out_(0),
+	  chip_(nullptr), line_in_(nullptr), line_out_(nullptr), count_frame_line_out_(0), count_frame_preview_out_(0),
 	  in_fmt_ctx_(nullptr), out_fmt_ctx_(nullptr), output_file_(options->output)
 {
 	if (options->circular || !options->save_pts.empty() || options->split)
@@ -445,6 +452,11 @@ void LibAvEncoder::EncodeBuffer(int fd, size_t size, void *mem, StreamInfo const
 		av_image_fill_pointers(frame->data, AV_PIX_FMT_YUV420P, frame->height, frame->buf[0]->data, frame->linesize);
 		av_frame_make_writable(frame);
 	}
+
+	// Always pass through frame memory pointer in the user-defined opaque pointer
+	// We need to use this pointer for the JPEG encoder later,
+	// and for AV_PIX_FMT_DRM_PRIME pixel format we'd otherwise have to map in the DRM buffer again.
+	frame->opaque = mem;
 
 	std::scoped_lock<std::mutex> lock(video_mutex_);
 	frame_queue_.push(frame);
@@ -712,6 +724,57 @@ extern "C" void LibAvEncoder::releaseBuffer(void *opaque, uint8_t *data)
 		enc->drm_frame_queue_.pop();
 }
 
+void LibAvEncoder::encodeJPEG(AVFrame *frame)
+{
+	struct jpeg_compress_struct cinfo;
+	struct jpeg_error_mgr jerr;
+	cinfo.err = jpeg_std_error(&jerr);
+	jpeg_create_compress(&cinfo);
+
+	cinfo.image_width = frame->width;
+	cinfo.image_height = frame->height;
+	cinfo.input_components = 3;
+	cinfo.in_color_space = JCS_YCbCr;
+	cinfo.restart_interval = 0;
+
+	jpeg_set_defaults(&cinfo);
+	cinfo.raw_data_in = TRUE;
+	jpeg_set_quality(&cinfo, options_->quality, TRUE);
+
+	FILE* preview_out_file = fopen(options_->preview_out.c_str(), "wb");
+	if (preview_out_file == nullptr)
+		throw std::runtime_error("Cannot open JPEG output file");
+	jpeg_stdio_dest(&cinfo, preview_out_file);
+
+	jpeg_start_compress(&cinfo, TRUE);
+
+	int stride2 = frame->linesize[0] / 2;
+	uint8_t *Y = (uint8_t *)frame->opaque;
+	uint8_t *U = (uint8_t *)Y + frame->linesize[0] * frame->height;
+	uint8_t *V = (uint8_t *)U + stride2 * (frame->height / 2);
+	uint8_t *Y_max = U - frame->linesize[0];
+	uint8_t *U_max = V - stride2;
+	uint8_t *V_max = U_max + stride2 * (frame->height / 2);
+
+	JSAMPROW y_rows[16];
+	JSAMPROW u_rows[8];
+	JSAMPROW v_rows[8];
+
+	for (uint8_t *Y_row = Y, *U_row = U, *V_row = V; cinfo.next_scanline < ((unsigned int)frame->height);)
+	{
+		for (int i = 0; i < 16; i++, Y_row += frame->linesize[0])
+			y_rows[i] = std::min(Y_row, Y_max);
+		for (int i = 0; i < 8; i++, U_row += stride2, V_row += stride2)
+			u_rows[i] = std::min(U_row, U_max), v_rows[i] = std::min(V_row, V_max);
+
+		JSAMPARRAY rows[] = { y_rows, u_rows, v_rows };
+		jpeg_write_raw_data(&cinfo, rows, 16);
+	}
+	jpeg_finish_compress(&cinfo);
+
+	fclose(preview_out_file);
+}
+
 void LibAvEncoder::videoThread()
 {
 	AVPacket *pkt = av_packet_alloc();
@@ -738,6 +801,14 @@ void LibAvEncoder::videoThread()
 				else
 					video_cv_.wait_for(lock, 200ms);
 			}
+		}
+
+		// Write a JPEG to the preview output once per second, if enabled
+		count_frame_preview_out_++;
+		if (!options_->preview_out.empty() && count_frame_preview_out_ >= options_->framerate.value_or(DEFAULT_FRAMERATE))
+		{
+			count_frame_preview_out_ = 0;
+			encodeJPEG(frame);
 		}
 
 		int ret = avcodec_send_frame(codec_ctx_[Video], frame);

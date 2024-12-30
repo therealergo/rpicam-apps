@@ -177,6 +177,7 @@ struct Options
 	bool no_raw;
 	unsigned int line_in;
 	unsigned int line_out;
+	std::string preview_out;
 
 	virtual bool Parse(int argc, char *argv[]);
 	virtual void Print() const;
