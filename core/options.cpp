@@ -309,6 +309,10 @@ Options::Options()
 			"Manual flicker correction period"
 			"\nSet to 10000us to cancel 50Hz flicker."
 			"\nSet to 8333us to cancel 60Hz flicker.\n")
+		("line-in", value<unsigned int>(&line_in)->default_value(0),
+			"Set an input GPIO line that controls recording.")
+		("line-out", value<unsigned int>(&line_out)->default_value(0),
+			"Set an output GPIO line that blinks at 1Hz while recording.")
 		;
 	// clang-format on
 

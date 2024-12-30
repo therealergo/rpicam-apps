@@ -175,6 +175,8 @@ struct Options
 	std::string hdr;
 	TimeVal<std::chrono::microseconds> flicker_period;
 	bool no_raw;
+	unsigned int line_in;
+	unsigned int line_out;
 
 	virtual bool Parse(int argc, char *argv[]);
 	virtual void Print() const;

@@ -34,6 +34,7 @@ elif neon == 'armv8-neon'
 endif
 
 dl_dep = dependency('dl', required : true)
+gpiod_dep = dependency('libgpiod', required : true)
 libcamera_dep = dependency('libcamera', required : true)
 
 summary({
@@ -43,7 +44,7 @@ summary({
         section : 'libcamera')
 
 rpicam_app_src = []
-rpicam_app_dep = [libcamera_dep, dl_dep]
+rpicam_app_dep = [libcamera_dep, gpiod_dep, dl_dep]
 
 subdir('core')
 subdir('encoder')

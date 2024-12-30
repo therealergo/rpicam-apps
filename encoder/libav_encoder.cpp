@@ -304,8 +304,9 @@ void LibAvEncoder::initAudioOutCodec(VideoOptions const *options, StreamInfo con
 }
 
 LibAvEncoder::LibAvEncoder(VideoOptions const *options, StreamInfo const &info)
-	: Encoder(options), output_ready_(false), abort_video_(false), abort_audio_(false), video_start_ts_(0), audio_start_ts_(0),
-	  audio_samples_(0), count_file_(0), count_frame_(0), in_fmt_ctx_(nullptr), out_fmt_ctx_(nullptr), output_file_(options->output)
+	: Encoder(options), output_ready_(false), abort_video_(false), abort_audio_(false), video_start_ts_(0), audio_start_ts_(0),  audio_samples_(0), count_file_(0), count_frame_(0),
+	  chip_(nullptr), line_in_(nullptr), line_out_(nullptr), count_frame_line_out_(0),
+	  in_fmt_ctx_(nullptr), out_fmt_ctx_(nullptr), output_file_(options->output)
 {
 	if (options->circular || !options->save_pts.empty() || options->split)
 		LOG_ERROR("\nERROR: Pi 5 and libav encoder does not currently support the circular, save_pts or "
@@ -320,6 +321,31 @@ LibAvEncoder::LibAvEncoder(VideoOptions const *options, StreamInfo const &info)
 	else
 	{
 		count_frame_segment_lim_ = 0;
+	}
+
+	if (options->line_in != 0 || options->line_out != 0)
+	{
+		chip_ = gpiod_chip_open_by_name("gpiochip0");
+		if (chip_ == nullptr)
+			throw std::runtime_error("Cannot open GPIO chip");
+	}
+	if (options->line_in != 0)
+	{
+		line_in_ = gpiod_chip_get_line(chip_, options->line_in);
+		if (line_in_ == nullptr)
+			throw std::runtime_error("Cannot open GPIO line in");
+		int ret_in = gpiod_line_request_input_flags(line_in_, "rpicam", GPIOD_LINE_REQUEST_FLAG_BIAS_PULL_UP);
+		if (ret_in < 0)
+			throw std::runtime_error("Cannot configure GPIO line in");
+	}
+	if (options->line_out != 0)
+	{
+		line_out_ = gpiod_chip_get_line(chip_, options->line_out);
+		if (line_out_ == nullptr)
+			throw std::runtime_error("Cannot open GPIO line out");
+		int ret_out = gpiod_line_request_output(line_out_, "rpicam", 0);
+		if (ret_out < 0)
+			throw std::runtime_error("Cannot configure GPIO line out");
 	}
 
 	avdevice_register_all();
@@ -362,6 +388,13 @@ LibAvEncoder::~LibAvEncoder()
 		avcodec_free_context(&codec_ctx_[AudioIn]);
 		avcodec_free_context(&codec_ctx_[AudioOut]);
 	}
+
+	if (line_in_ != nullptr)
+		gpiod_line_release(line_in_);
+	if (line_out_ != nullptr)
+		gpiod_line_release(line_out_);
+	if (chip_ != nullptr)
+		gpiod_chip_close(chip_);
 
 	LOG(2, "libav: codec closed");
 }
@@ -560,72 +593,109 @@ void LibAvEncoder::encode(AVPacket *pkt, unsigned int stream_id)
 		else if (ret < 0)
 			throw std::runtime_error("libav: error receiving packet: " + std::to_string(ret));
 
-		// Initialise the ouput mux on the first received video packet, as we may need
-		// to copy global header data from the encoder.
-		if (stream_id == Video && !output_ready_)
+		// Read input line to determine whether to record
+		int should_rec = 1;
+		if (line_in_ != nullptr)
+			should_rec = gpiod_line_get_value(line_in_);
+		if (should_rec < 0)
+			throw std::runtime_error("Cannot read GPIO line in");
+		if (should_rec == 0)
 		{
-			initOutput();
-			output_ready_ = true;
-		}
-
-		pkt->stream_index = stream_id;
-		pkt->pos = -1;
-		pkt->duration = 0;
-
-		// Rescale from the codec timebase to the stream timebase.
-		av_packet_rescale_ts(pkt, codec_ctx_[stream_id]->time_base, out_fmt_ctx_->streams[stream_id]->time_base);
-
-		std::scoped_lock<std::mutex> lock(output_mutex_);
-
-		// When we've reached the split frame count, and we're on a key frame
-		if (count_frame_segment_lim_ > 0)
-		{
-			if (stream_id == Video)
+			// If we shouldn't record, close any current recording and turn off output GPIO
+			if (output_ready_)
 			{
-				count_frame_++;
-			}
-			if (count_frame_ >= count_frame_segment_lim_ &&
-			    (pkt->flags & AV_PKT_FLAG_KEY) != 0)
-			{
-				count_frame_ = 0;
-
-				// Close current file
+				output_ready_ = false;
 				deinitOutput();
-
-				// Reset all timestamps, re-syncing audio and video
-				video_start_ts_ = 0;
-				audio_start_ts_ = 0;
-
-				// Open new file
-				initOutput();
+				count_frame_ = 0;
+				count_frame_line_out_ = 0;
 			}
-		}
-
-		// Adjust output timestamps based on current computed start timestamps
-		if (stream_id == Video)
-		{
-			if (video_start_ts_ == 0)
-				video_start_ts_ = pkt->dts;
-			pkt->pts -= video_start_ts_;
-			pkt->dts -= video_start_ts_;
+			if (line_out_ != nullptr)
+			{
+				int ret_set_out = gpiod_line_set_value(line_out_, 0);
+				if (ret_set_out < 0)
+					throw std::runtime_error("Cannot set GPIO line out");
+			}
 		}
 		else
 		{
-			if (audio_start_ts_ == 0)
-				audio_start_ts_ = pkt->dts;
-			pkt->pts -= audio_start_ts_;
-			pkt->dts -= audio_start_ts_;
-		}
 
-		// pkt is now blank (av_interleaved_write_frame() takes ownership of
-		// its contents and resets pkt), so that no unreferencing is necessary.
-		// This would be different if one used av_write_frame().
-		ret = av_interleaved_write_frame(out_fmt_ctx_, pkt);
-		if (ret < 0)
-		{
-			char err[AV_ERROR_MAX_STRING_SIZE];
-			av_strerror(ret, err, sizeof(err));
-			throw std::runtime_error("libav: error writing output: " + std::string(err));
+			// Blink output GPIO at 1Hz while we're recording
+			if (line_out_ != nullptr && stream_id == Video)
+			{
+				unsigned int framerate = options_->framerate.value_or(DEFAULT_FRAMERATE);
+				count_frame_line_out_ = (count_frame_line_out_ + 1) % (framerate * 2);
+				int ret_set_out = gpiod_line_set_value(line_out_, count_frame_line_out_ > framerate ? 0 : 1);
+				if (ret_set_out < 0)
+					throw std::runtime_error("Cannot set GPIO line out");
+			}
+
+			// Initialise the ouput mux on the first received video packet, as we may need
+			// to copy global header data from the encoder.
+			if (stream_id == Video && !output_ready_)
+			{
+				initOutput();
+				output_ready_ = true;
+			}
+
+			pkt->stream_index = stream_id;
+			pkt->pos = -1;
+			pkt->duration = 0;
+
+			// Rescale from the codec timebase to the stream timebase.
+			av_packet_rescale_ts(pkt, codec_ctx_[stream_id]->time_base, out_fmt_ctx_->streams[stream_id]->time_base);
+
+			std::scoped_lock<std::mutex> lock(output_mutex_);
+
+			// When we've reached the split frame count, and we're on a key frame
+			if (count_frame_segment_lim_ > 0)
+			{
+				if (stream_id == Video)
+				{
+					count_frame_++;
+				}
+				if (count_frame_ >= count_frame_segment_lim_ &&
+				    (pkt->flags & AV_PKT_FLAG_KEY) != 0)
+				{
+					count_frame_ = 0;
+
+					// Close current file
+					deinitOutput();
+
+					// Reset all timestamps, re-syncing audio and video
+					video_start_ts_ = 0;
+					audio_start_ts_ = 0;
+
+					// Open new file
+					initOutput();
+				}
+			}
+
+			// Adjust output timestamps based on current computed start timestamps
+			if (stream_id == Video)
+			{
+				if (video_start_ts_ == 0)
+					video_start_ts_ = pkt->dts;
+				pkt->pts -= video_start_ts_;
+				pkt->dts -= video_start_ts_;
+			}
+			else
+			{
+				if (audio_start_ts_ == 0)
+					audio_start_ts_ = pkt->dts;
+				pkt->pts -= audio_start_ts_;
+				pkt->dts -= audio_start_ts_;
+			}
+
+			// pkt is now blank (av_interleaved_write_frame() takes ownership of
+			// its contents and resets pkt), so that no unreferencing is necessary.
+			// This would be different if one used av_write_frame().
+			ret = av_interleaved_write_frame(out_fmt_ctx_, pkt);
+			if (ret < 0)
+			{
+				char err[AV_ERROR_MAX_STRING_SIZE];
+				av_strerror(ret, err, sizeof(err));
+				throw std::runtime_error("libav: error writing output: " + std::string(err));
+			}
 		}
 	}
 }

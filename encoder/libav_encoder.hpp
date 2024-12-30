@@ -29,6 +29,8 @@ extern "C"
 #include "libswresample/swresample.h"
 }
 
+#include "gpiod.h"
+
 #include "encoder.hpp"
 
 class LibAvEncoder : public Encoder
@@ -63,6 +65,11 @@ private:
 	unsigned int count_frame_;
 	unsigned int count_frame_segment_lim_;
 	const char *format_;
+
+	struct gpiod_chip *chip_;
+	struct gpiod_line *line_in_;
+	struct gpiod_line *line_out_;
+	unsigned int count_frame_line_out_;
 
 	std::queue<AVFrame *> frame_queue_;
 	std::mutex video_mutex_;
