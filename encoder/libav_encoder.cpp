@@ -618,6 +618,8 @@ void LibAvEncoder::encode(AVPacket *pkt, unsigned int stream_id)
 			{
 				output_ready_ = false;
 				deinitOutput();
+				video_start_ts_ = 0;
+				audio_start_ts_ = 0;
 				count_frame_ = 0;
 				count_frame_line_out_ = 0;
 			}
