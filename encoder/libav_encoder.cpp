@@ -398,8 +398,10 @@ LibAvEncoder::~LibAvEncoder()
 
 	if (line_in_ != nullptr)
 		gpiod_line_release(line_in_);
-	if (line_out_ != nullptr)
+	if (line_out_ != nullptr) {
+		gpiod_line_set_value(line_out_, 0);
 		gpiod_line_release(line_out_);
+	}
 	if (chip_ != nullptr)
 		gpiod_chip_close(chip_);
 
